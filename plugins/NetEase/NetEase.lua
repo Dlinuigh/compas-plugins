@@ -17,7 +17,7 @@ plain Lua because the sandbox has no cipher API. Copy NetEase.lua to
 plugin.define({
     id = "community.netease",
     name = "NetEase Cloud Music",
-    version = "0.1.1",
+    version = "0.1.2",
     api_min = 17,
 })
 
@@ -36,6 +36,8 @@ local PAGE = 30
 -- json_decode caps a reply at 10000 entries; a song detail is ~150, a user playlist ~80.
 local DETAIL_BATCH = 40
 local PLAYLIST_PAGE = 50
+-- Concurrent song-detail requests while a playlist fills in (http_request allows 4).
+local DETAIL_PARALLEL = 2
 local SEARCH_CAP = 90
 local BROWSE_CAP = 475
 local REMOTE_QUEUE_CAP = 500
@@ -522,29 +524,82 @@ local function show_tracks(title, tracks)
     end)
 end
 
--- Song details for ids, in batches, preserving order. done(tracks) or done(nil, err).
-local function fetch_song_details(ids, done)
+-- Opens the list after the first detail batch, then fetches the rest
+-- DETAIL_PARALLEL at a time and replaces the list in place (scroll kept).
+-- Rows only ever grow as a contiguous prefix of ids, so indices stay valid.
+local function show_tracks_progressive(title, ids, parent, on_first_error)
     local generation = browse_generation
-    local by_id = {}
-    local function batch(from)
-        if from > #ids then
-            local ordered = {}
-            for _, id in ipairs(ids) do
-                if by_id[id] then ordered[#ordered + 1] = by_id[id] end
-            end
-            done(ordered)
-            return
+    local by_id, done, attempts = {}, {}, {}
+    local batch_count = math.ceil(#ids / DETAIL_BATCH)
+    local next_batch, in_flight, contiguous = 1, 0, 0
+    local tracks, handle, stopped = {}, nil, false
+
+    local function render()
+        local upto = math.min(#ids, contiguous * DETAIL_BATCH)
+        tracks = {}
+        for i = 1, upto do
+            if by_id[ids[i]] then tracks[#tracks + 1] = by_id[ids[i]] end
         end
+        local rows = { { label = "播放全部", play_all = true } }
+        for i = 1, math.min(#tracks, BROWSE_CAP) do rows[#rows + 1] = tracks[i] end
+        local labels = {}
+        for i, row in ipairs(rows) do labels[i] = clip_utf8(row.label, 140) end
+        local heading = upto < #ids and (title .. "  " .. upto .. "/" .. #ids) or title
+        local on_select = function(index)
+            local row = rows[index]
+            if not row then return end
+            if row.play_all then play_tracks(tracks, 1) else play_tracks(tracks, index - 1) end
+        end
+        if handle then
+            if not plugin.is_list_showing(handle) then stopped = true return end
+            handle = show_list(heading, labels, on_select, { replace = handle })
+            if not handle then stopped = true end
+        else
+            if not parent_showing(parent) then stopped = true return end
+            handle = show_list(heading, labels, on_select)
+        end
+    end
+
+    local pump
+    local function fetch(batch)
+        in_flight = in_flight + 1
+        attempts[batch] = (attempts[batch] or 0) + 1
+        local from = (batch - 1) * DETAIL_BATCH + 1
         local parts = {}
         for i = from, math.min(#ids, from + DETAIL_BATCH - 1) do parts[#parts + 1] = '{"id":' .. ids[i] .. '}' end
         eapi("/api/v3/song/detail", { c = "[" .. table.concat(parts, ",") .. "]" }, function(data, err)
-            if generation ~= browse_generation then return end
-            if not data then done(nil, err) return end
+            in_flight = in_flight - 1
+            if generation ~= browse_generation or stopped then return end
+            if not data then
+                if batch == 1 and not handle then
+                    stopped = true
+                    on_first_error(err)
+                elseif attempts[batch] < 3 then
+                    fetch(batch)
+                else
+                    stopped = true
+                    toast(err)
+                end
+                return
+            end
             for _, track in ipairs(tracks_from(data.songs)) do by_id[track.id] = track end
-            batch(from + DETAIL_BATCH)
+            done[batch] = true
+            local before = contiguous
+            while done[contiguous + 1] do contiguous = contiguous + 1 end
+            if contiguous ~= before then render() end
+            if not stopped then pump() end
         end)
     end
-    batch(1)
+
+    pump = function()
+        local limit = handle and DETAIL_PARALLEL or 1
+        while not stopped and in_flight < limit and next_batch <= batch_count do
+            local batch = next_batch
+            next_batch = next_batch + 1
+            fetch(batch)
+        end
+    end
+    pump()
 end
 
 local function open_playlist(playlist, parent)
@@ -575,14 +630,9 @@ local function open_playlist(playlist, parent)
                 end
                 return
             end
-            fetch_song_details(ids, function(tracks, detail_err)
-                if generation ~= browse_generation or not parent_showing(active or parent) then return end
-                if not tracks then
-                    toast(detail_err)
-                    show_retry(active or parent, load)
-                    return
-                end
-                show_tracks(playlist.name, tracks)
+            show_tracks_progressive(playlist.name, ids, active or parent, function(detail_err)
+                toast(detail_err)
+                show_retry(active or parent, load)
             end)
         end, true)
     end
