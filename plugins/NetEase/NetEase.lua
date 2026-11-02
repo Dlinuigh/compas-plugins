@@ -17,7 +17,7 @@ plain Lua because the sandbox has no cipher API. Copy NetEase.lua to
 plugin.define({
     id = "community.netease",
     name = "NetEase Cloud Music",
-    version = "0.1.0",
+    version = "0.1.1",
     api_min = 17,
 })
 
@@ -33,7 +33,9 @@ local USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 C
 local SESSION_DIR = "NetEase"
 local SESSION_FILE = "session.txt"
 local PAGE = 30
-local DETAIL_BATCH = 100
+-- json_decode caps a reply at 10000 entries; a song detail is ~150, a user playlist ~80.
+local DETAIL_BATCH = 40
+local PLAYLIST_PAGE = 50
 local SEARCH_CAP = 90
 local BROWSE_CAP = 475
 local REMOTE_QUEUE_CAP = 500
@@ -257,7 +259,8 @@ end
 -- Transport
 ---------------------------------------------------------------------------
 
-local function eapi(api, fields, callback)
+-- raw = true hands the undecoded body to callback (for replies too large to decode).
+local function eapi(api, fields, callback, raw)
     local generation = session_generation
     local handle, start_err = plugin.http_request({
         url = EAPI .. api:gsub("^/api", ""),
@@ -275,6 +278,7 @@ local function eapi(api, fields, callback)
         if generation ~= session_generation then return end
         if err then callback(nil, err) return end
         if status ~= 200 then callback(nil, "HTTP " .. tostring(status)) return end
+        if raw then callback(body or "") return end
         local data, decode_err = plugin.json_decode(body or "", { max_input_bytes = JSON_LIMIT })
         if type(data) ~= "table" then callback(nil, decode_err or "unreadable reply") return end
         local code = tonumber(data.code)
@@ -546,20 +550,31 @@ end
 local function open_playlist(playlist, parent)
     local generation = browse_generation
     local function load(active)
-        eapi("/api/v6/playlist/detail", { id = playlist.id, n = "0", s = "0" }, function(data, err)
+        eapi("/api/v6/playlist/detail", { id = playlist.id, n = "0", s = "0" }, function(body, err)
             if generation ~= browse_generation or not parent_showing(active or parent) then return end
-            local detail = data and data.playlist
-            if type(detail) ~= "table" then
-                toast(err)
-                show_retry(active or parent, load)
+            -- trackIds alone exceeds the json_decode entry cap past ~700 tracks, so scan it.
+            local ids = {}
+            local from = body and body:find('"trackIds":[', 1, true)
+            if from then
+                for id in body:gmatch('{"id":(%d+),"v":', from) do
+                    ids[#ids + 1] = id
+                    if #ids >= REMOTE_QUEUE_CAP then break end
+                end
+            end
+            if #ids == 0 then
+                if body and not err then
+                    local data = plugin.json_decode(body, { max_input_bytes = JSON_LIMIT })
+                    local code = type(data) == "table" and tonumber(data.code)
+                    if code and code ~= 200 then err = data.message or data.msg or ("code " .. id_string(code)) end
+                end
+                if err then
+                    toast(err)
+                    show_retry(active or parent, load)
+                else
+                    toast("没有曲目")
+                end
                 return
             end
-            local ids = {}
-            for _, entry in ipairs(type(detail.trackIds) == "table" and detail.trackIds or {}) do
-                if type(entry) == "table" and entry.id ~= nil then ids[#ids + 1] = id_string(entry.id) end
-                if #ids >= REMOTE_QUEUE_CAP then break end
-            end
-            if #ids == 0 then toast("没有曲目") return end
             fetch_song_details(ids, function(tracks, detail_err)
                 if generation ~= browse_generation or not parent_showing(active or parent) then return end
                 if not tracks then
@@ -569,7 +584,7 @@ local function open_playlist(playlist, parent)
                 end
                 show_tracks(playlist.name, tracks)
             end)
-        end)
+        end, true)
     end
     load(nil)
 end
@@ -683,7 +698,7 @@ local function fetch_my_playlists(done)
     local generation = browse_generation
     local all = {}
     local function page(offset)
-        eapi("/api/user/playlist", { uid = uid, limit = "100", offset = tostring(offset), includeVideo = "false" },
+        eapi("/api/user/playlist", { uid = uid, limit = tostring(PLAYLIST_PAGE), offset = tostring(offset), includeVideo = "false" },
             function(data, err)
                 if generation ~= browse_generation then return end
                 if not data then done(nil, err) return end
